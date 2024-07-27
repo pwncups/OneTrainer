@@ -22,6 +22,7 @@ from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TimeUnit import TimeUnit
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.torch_util import default_device
 
@@ -74,6 +75,18 @@ class TrainOptimizerConfig(BaseConfig):
     warmup_init: bool
     weight_decay: float
     weight_lr_power: float
+    decoupled_decay: bool
+    fixed_decay: bool
+    weight_decouple: bool
+    rectify: bool
+    degenerated_to_sgd: bool
+    k: int
+    xi: float
+    n_sma_threshold: int
+    ams_bound: bool
+    r: float
+    adanorm: bool
+    adam_debias: bool
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super(TrainOptimizerConfig, self).__init__(data)
@@ -130,17 +143,31 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("warmup_init", False, bool, False))
         data.append(("weight_decay", None, float, True))
         data.append(("weight_lr_power", None, float, True))
+        data.append(("decoupled_decay", False, bool, False))
+        data.append(("fixed_decay", False, bool, False))
+        data.append(("rectify", False, bool, False))
+        data.append(("degenerated_to_sgd", False, bool, False))
+        data.append(("k", None, int, True))
+        data.append(("xi", None, float, True))
+        data.append(("n_sma_threshold", None, int, True))
+        data.append(("ams_bound", False, bool, False))
+        data.append(("r", None, float, True))
+        data.append(("adanorm", False, bool, False))
+        data.append(("adam_debias", False, bool, False))
 
         return TrainOptimizerConfig(data)
 
 
 class TrainModelPartConfig(BaseConfig):
     model_name: str
+    include: bool
     train: bool
     stop_training_after: int
     stop_training_after_unit: TimeUnit
     learning_rate: float
     weight_dtype: DataType
+    dropout_probability: float
+    train_embedding: bool
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super(TrainModelPartConfig, self).__init__(data)
@@ -151,11 +178,14 @@ class TrainModelPartConfig(BaseConfig):
 
         # name, default value, data type, nullable
         data.append(("model_name", "", str, False))
+        data.append(("include", True, bool, False))
         data.append(("train", True, bool, False))
         data.append(("stop_training_after", None, int, True))
         data.append(("stop_training_after_unit", TimeUnit.NEVER, TimeUnit, False))
         data.append(("learning_rate", None, float, True))
         data.append(("weight_dtype", DataType.NONE, DataType, False))
+        data.append(("dropout_probability", 0.0, float, False))
+        data.append(("train_embedding", True, bool, False))
 
         return TrainModelPartConfig(data)
 
@@ -264,8 +294,10 @@ class TrainConfig(BaseConfig):
     rescale_noise_scheduler_to_zero_terminal_snr: bool
     force_v_prediction: bool
     force_epsilon_prediction: bool
+    timestep_distribution: TimestepDistribution
     min_noising_strength: float
     max_noising_strength: float
+
     noising_weight: float
     noising_bias: float
 
@@ -282,6 +314,10 @@ class TrainConfig(BaseConfig):
     # text encoder 2
     text_encoder_2: TrainModelPartConfig
     text_encoder_2_layer_skip: int
+
+    # text encoder 3
+    text_encoder_3: TrainModelPartConfig
+    text_encoder_3_layer_skip: int
 
     # vae
     vae: TrainModelPartConfig
@@ -344,11 +380,12 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super(TrainConfig, self).__init__(
             data,
-            config_version=3,
+            config_version=4,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
                 2: self.__migration_2,
+                3: self.__migration_3,
             }
         )
 
@@ -475,12 +512,30 @@ class TrainConfig(BaseConfig):
 
         return migrated_data
 
+    def __migration_3(self, data: dict) -> dict:
+        migrated_data = data.copy()
+
+        noising_weight = migrated_data.pop("noising_weight", 0.0)
+        noising_bias = migrated_data.pop("noising_bias", 0.5)
+
+        if noising_weight != 0:
+            migrated_data["timestep_distribution"] = TimestepDistribution.SIGMOID
+            migrated_data["noising_weight"] = noising_weight
+            migrated_data["noising_bias"] = noising_bias - 0.5
+        else:
+            migrated_data["timestep_distribution"] = TimestepDistribution.UNIFORM
+            migrated_data["noising_weight"] = 0.0
+            migrated_data["noising_bias"] = 0.0
+
+        return migrated_data
+
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
             self.weight_dtype if self.unet.weight_dtype == DataType.NONE else self.unet.weight_dtype,
             self.weight_dtype if self.prior.weight_dtype == DataType.NONE else self.prior.weight_dtype,
             self.weight_dtype if self.text_encoder.weight_dtype == DataType.NONE else self.text_encoder.weight_dtype,
             self.weight_dtype if self.text_encoder_2.weight_dtype == DataType.NONE else self.text_encoder_2.weight_dtype,
+            self.weight_dtype if self.text_encoder_3.weight_dtype == DataType.NONE else self.text_encoder_3.weight_dtype,
             self.weight_dtype if self.vae.weight_dtype == DataType.NONE else self.vae.weight_dtype,
             self.weight_dtype if self.effnet_encoder.weight_dtype == DataType.NONE else self.effnet_encoder.weight_dtype,
             self.weight_dtype if self.decoder.weight_dtype == DataType.NONE else self.decoder.weight_dtype,
@@ -501,11 +556,26 @@ class TrainConfig(BaseConfig):
             embedding=EmbeddingName(self.embedding.uuid, self.embedding.model_name),
             additional_embeddings=[EmbeddingName(embedding.uuid, embedding.model_name) for embedding in
                                    self.additional_embeddings],
+            include_text_encoder=self.text_encoder.include,
+            include_text_encoder_2=self.text_encoder_2.include,
+            include_text_encoder_3=self.text_encoder_3.include,
         )
 
     def train_any_embedding(self) -> bool:
         return self.training_method == TrainingMethod.EMBEDDING \
             or any(embedding.train for embedding in self.additional_embeddings)
+
+    def train_text_encoder_or_embedding(self) -> bool:
+        return (self.text_encoder.train and self.training_method != TrainingMethod.EMBEDDING) \
+            or (self.text_encoder.train_embedding and self.train_any_embedding())
+
+    def train_text_encoder_2_or_embedding(self) -> bool:
+        return (self.text_encoder_2.train and self.training_method != TrainingMethod.EMBEDDING) \
+            or (self.text_encoder_2.train_embedding and self.train_any_embedding())
+
+    def train_text_encoder_3_or_embedding(self) -> bool:
+        return (self.text_encoder_3.train and self.training_method != TrainingMethod.EMBEDDING) \
+            or (self.text_encoder_3.train_embedding and self.train_any_embedding())
 
     def to_settings_dict(self) -> dict:
         config = TrainConfig.default_values().from_dict(self.to_dict())
@@ -618,8 +688,9 @@ class TrainConfig(BaseConfig):
         data.append(("force_epsilon_prediction", False, bool, False))
         data.append(("min_noising_strength", 0.0, float, False))
         data.append(("max_noising_strength", 1.0, float, False))
+        data.append(("timestep_distribution", TimestepDistribution.UNIFORM, TimestepDistribution, False))
         data.append(("noising_weight", 0.0, float, False))
-        data.append(("noising_bias", 0.5, float, False))
+        data.append(("noising_bias", 0.0, float, False))
 
         # unet
         unet = TrainModelPartConfig.default_values()
@@ -657,6 +728,16 @@ class TrainConfig(BaseConfig):
         text_encoder_2.weight_dtype = DataType.NONE
         data.append(("text_encoder_2", text_encoder_2, TrainModelPartConfig, False))
         data.append(("text_encoder_2_layer_skip", 0, int, False))
+
+        # text encoder 3
+        text_encoder_3 = TrainModelPartConfig.default_values()
+        text_encoder_3.train = True
+        text_encoder_3.stop_training_after = 30
+        text_encoder_3.stop_training_after_unit = TimeUnit.EPOCH
+        text_encoder_3.learning_rate = None
+        text_encoder_3.weight_dtype = DataType.NONE
+        data.append(("text_encoder_3", text_encoder_3, TrainModelPartConfig, False))
+        data.append(("text_encoder_3_layer_skip", 0, int, False))
 
         # vae
         vae = TrainModelPartConfig.default_values()
